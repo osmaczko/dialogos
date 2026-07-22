@@ -1,0 +1,137 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# Action version tags (@vNN) and the license allowlist in deny.toml are the two
+# things that cannot be verified without running this workflow. The first run on
+# CI confirms or corrects them; pin actions to a released SHA once green.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Builds the native logos-delivery closure once and saves the nix store to the
+  # GitHub Actions cache. Dependent jobs restore it instead of rebuilding (the
+  # cold Nim/nwaku build is ~1-3h). If the 10GB Actions cache proves too small
+  # for the closure, upgrade to a Cachix cache (see the commented step below).
+  # Note: fork PRs get a read-only token and cannot save the cache, so their
+  # lint/test jobs cold-build independently; a Cachix cache (readable by forks)
+  # is the fix if fork PRs become common.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      # Recommended upgrade when the closure outgrows the Actions cache: a Cachix
+      # cache (free for public repos). Needs a cache created by the maintainer and
+      # a CACHIX_AUTH_TOKEN repo secret, then replace cache-nix-action with:
+      # - uses: cachix/cachix-action@v15
+      #   with:
+      #     name: <your-cachix-cache>
+      #     authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      # Building the image realizes the dialogos package and the whole native
+      # closure too (dialogos is in the image's `contents`), so this one build
+      # warms the cache for lint and test while producing the loadable tarball.
+      - run: nix build .#image --print-build-logs
+      - run: cp -L result dialogos-image.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dialogos-image
+          path: dialogos-image.tar.gz
+          if-no-files-found: error
+
+  lint:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      - run: nix develop --command bash -euo pipefail -c "cargo fmt --all --check && cargo clippy --all-targets --all-features -- -D warnings"
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      - run: nix develop --command cargo test --all-targets
+
+  # No nix: operates off Cargo.lock alone, so it runs fast and in parallel.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-pins.sh
+
+  # Push the image to GHCR on version tags, once everything else is green.
+  publish-image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, lint, test, deny, pins]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      - run: nix build .#image --print-build-logs
+      - name: Load, tag, and push the image
+        run: |
+          set -euo pipefail
+          docker load < result
+          ref="${GITHUB_REF_NAME}"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag dialogos:latest "${image}:${ref}"
+          docker tag dialogos:latest "${image}:latest"
+          docker push "${image}:${ref}"
+          docker push "${image}:latest"

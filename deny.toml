@@ -1,0 +1,50 @@
+# cargo-deny configuration. Advisories are denied; licenses are allowlisted.
+# The allowlist below is a starting set for a large transitive tree (~570
+# crates); the first `cargo deny check licenses` run reports any license not
+# covered here, and the fix is to add the reviewed SPDX id, not to widen the
+# match. `sources` allows the git deps we depend on by design.
+
+[advisories]
+# Any advisory in the RustSec database fails the build. Add a rev-scoped entry
+# to `ignore` (with a reason) only when an advisory has no fix and is assessed
+# as not reachable.
+ignore = []
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-DFS-2016",
+  "Unicode-3.0",
+  "MPL-2.0",
+  "CC0-1.0",
+  # aws-lc-sys and ring both carry an OpenSSL-derived conjunct in the tree.
+  "OpenSSL",
+]
+confidence-threshold = 0.9
+
+# ring ships no SPDX `license` field, only a concatenated LICENSE file that
+# askalono cannot match, so it must be clarified explicitly. Omitting the
+# license-files hash applies the clarification unconditionally; pin the hash
+# (from the first `cargo deny` run's output) to also guard against upstream
+# changing the file.
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+  "https://github.com/logos-messaging/libchat.git",
+  "https://github.com/logos-messaging/chat_proto",
+  "https://github.com/vacp2p/de-mls",
+]
