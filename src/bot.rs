@@ -187,7 +187,7 @@ pub fn run(
                 // Liveness heartbeat (systemd watchdog), and a periodic stats line.
                 on_heartbeat();
                 tick_count += 1;
-                if tick_count % STATS_EVERY == 0 {
+                if tick_count.is_multiple_of(STATS_EVERY) {
                     emit_stats(&state, &retries, current_day());
                 }
             },
