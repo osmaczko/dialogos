@@ -61,32 +61,29 @@ provider rather than trusting a hard-coded id. See the example config.
 
 ## Build and run
 
-The bot depends on `logos-chat` by git rev over SSH, so you need SSH access to
-the libchat repository. Two facts make the build non-obvious:
-
-- The transitive `logos-delivery-rust` build script needs the native
-  `liblogosdelivery` library (a Nim/nwaku node). Point `LOGOS_DELIVERY_LIB_DIR`
-  at a prebuilt copy, or the script falls back to running
-  `nix build .#logos-delivery` itself (a heavy build).
-- The **runtime** glibc must match the native library's. A plain `cargo build`
-  can link and then fail to start with a `GLIBC_ABI_DT_X86_64_PLT` error; the
-  fix is to build and run inside libchat's `nix develop` so both use the same
-  glibc. A cold build also needs `protoc` on `PATH`.
-
-With a libchat checkout that already has the native library built:
+The build pulls in the native `liblogosdelivery` library (a Nim/nwaku node)
+transitively, and the runtime glibc must match the one it was built against: a
+plain `cargo build` can link and then fail to start with a
+`GLIBC_ABI_DT_X86_64_PLT` error. The flake pins both by following libchat's own
+nixpkgs, so nix is the supported path:
 
 ```sh
-export LOGOS_DELIVERY_LIB_DIR="$(nix build --no-link --print-out-paths <libchat>#logos-delivery)/lib"
 export DIALOGOS_DB_KEY=...        # any strong secret
 export LLM_API_KEY=...            # your provider key
-cargo run --release -- --config ./dialogos.toml
+nix develop --command cargo run -- --config ./dialogos.toml
+# or build the binary / the container image:
+nix build .#dialogos
+nix build .#image
 ```
 
-If startup hits the glibc symbol error, run the same command inside libchat's
-`nix develop`. For a repo others can build without a hand-set env var, add a
-`flake.nix` that takes libchat as an input and wires the native library and a
-matching glibc for both build and run. This is a follow-up, not needed to run it
-here.
+`make run`, `make build`, and `make image` wrap these. Without nix, supply the
+native library yourself and build in an environment whose glibc matches it:
+
+```sh
+export LOGOS_DELIVERY_LIB_DIR="<path to a prebuilt liblogosdelivery>/lib"
+export DIALOGOS_DB_KEY=... LLM_API_KEY=...
+cargo run --release -- --config ./dialogos.toml   # a cold build also needs protoc on PATH
+```
 
 ## Deployment (process isolation)
 
@@ -108,6 +105,7 @@ provider. Both are consequences of the chosen posture, not mitigated here.
 
 ```
 src/
+  lib.rs      crate root: module declarations and crate-level docs
   main.rs     startup: load config, open the client, print the address, run
   config.rs   TOML + environment secrets, with fail-fast validation
   llm.rs      LlmBackend trait + the OpenAI-compatible backend
@@ -121,15 +119,16 @@ tests/
 ## Testing
 
 ```sh
-cargo test
+make test        # nix develop --command cargo test --all-targets
+make check       # pins + lint + test + cargo-deny, the same set CI runs
 ```
 
 The unit tests (config parsing, the rate limiter, the LLM request/response
-mapping) and the integration test (a peer talking to the bot over the
-in-process transport with a fake backend) all live in-crate. Compiling the
-crate pulls the native `logos-chat` dependency, so `cargo test` needs the same
-native-library and glibc setup as a build. Run it under the nix/CI path, not on
-a box without the native library.
+mapping) live in-crate; the integration tests (a peer talking to the bot over
+the in-process transport with a fake backend) live under `tests/`. Compiling the
+crate pulls the native `logos-chat` dependency, so the tests need the nix
+toolchain (or an equivalent native-library and glibc setup); they run in CI on
+every push.
 
 ## License
 
