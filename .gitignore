@@ -1,0 +1,7 @@
+/target
+# Local runtime state and secrets. Never commit.
+/dialogos.toml
+/dialogos.db
+*.db
+secrets.env
+.env

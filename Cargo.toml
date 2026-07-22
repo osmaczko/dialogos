@@ -1,0 +1,36 @@
+[package]
+name = "dialogos"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A passive AI chat bot on the Logos chat network, built on libchat."
+repository = "https://github.com/osmaczko/dialogos"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "dialogos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dialogos"
+path = "src/main.rs"
+
+[dependencies]
+logos-chat = { git = "ssh://git@github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231" }
+crossbeam-channel = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# TestLogosAccount, to stand up a peer that talks to the bot over the
+# in-process transport in the integration test. Same rev as logos-chat.
+logos-account = { git = "ssh://git@github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231", features = ["dev"] }
+# IdentId, to construct MessageSender in the deterministic handle_event test.
+libchat = { git = "ssh://git@github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231" }

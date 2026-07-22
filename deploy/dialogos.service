@@ -1,0 +1,55 @@
+[Unit]
+Description=Logos chat bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Dedicated unprivileged identity, allocated per start; no host user footprint.
+DynamicUser=true
+StateDirectory=dialogos
+WorkingDirectory=/var/lib/dialogos
+ExecStart=/usr/local/bin/dialogos --config /etc/dialogos/config.toml
+Environment=RUST_LOG=info
+# DIALOGOS_DB_KEY and LLM_API_KEY. Keep this file root-owned, mode 0600.
+EnvironmentFile=/etc/dialogos/secrets.env
+
+# --- Isolation (level b): deny host access, contain the blast radius of a
+# --- fault in the in-process native p2p node that parses untrusted traffic.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Outbound p2p + HTTPS need inet; AF_UNIX for local sockets. No other families.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/dialogos
+UMask=0077
+MemoryMax=1G
+# If the embedded native node fails to start, relax these in order: first
+# MemoryDenyWriteExecute (some native runtimes require W+X memory), then
+# RestrictAddressFamilies (add AF_NETLINK if the node needs interface
+# enumeration), then SystemCallFilter. Loosen only what is needed.
+
+# One run = one address (accepted). A restart comes back on a NEW address, and
+# all prior conversations are permanently lost.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,47 @@
+# dialogos configuration. Copy to dialogos.toml and edit.
+# Secrets are NOT in this file: the encrypted-store key and the LLM API key
+# come from the environment (DIALOGOS_DB_KEY, LLM_API_KEY). See the README.
+
+[identity]
+# Encrypted on-disk store path. Holds only bookkeeping (metadata, keys), not the
+# in-memory MLS group state, and the identity is regenerated every run, so the
+# address changes on restart and prior conversations cannot be resumed (see the
+# README's "Accepted limitations").
+db_path = "./dialogos.db"
+# registry_url = "https://devnet.chat-kc.logos.co"   # optional; this is the default
+
+[llm]
+# Any OpenAI-compatible /chat/completions endpoint. OpenRouter is a good
+# default: one endpoint fronting many models, including free ones (ids suffixed
+# ":free"). Pick a current free chat model from https://openrouter.ai/models.
+# The free list and its limits change, so do not trust a hard-coded id.
+base_url = "https://openrouter.ai/api/v1"
+model = "<pick a :free chat model from openrouter.ai/models>"
+system_prompt_path = "./system-prompt.txt"
+max_output_tokens = 512
+temperature = 0.7
+request_timeout_secs = 60
+
+# Equally valid free alternatives (same code path, config-only swap):
+#   Google AI Studio (Gemini free tier):
+#     base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+#   Groq free tier:
+#     base_url = "https://api.groq.com/openai/v1"
+#   Local, zero egress (ollama):
+#     base_url = "http://localhost:11434/v1"
+# Verify the exact endpoint path and a current free model id at the provider.
+
+[limits]
+# Per-conversation sliding window (anti-flood). On a trip the bot sends one
+# canned reply, then stays silent for the rest of the window.
+per_convo_max_messages = 10
+per_convo_window_secs = 300
+# Global daily budget: the real spend cap. Whichever is hit first stops
+# replies until the next UTC-midnight reset.
+global_daily_max_messages = 2000
+global_daily_max_tokens = 500000
+
+[behavior]
+greeting = "Hi, I'm an AI assistant. Ask me anything."
+history_turns = 8         # conversation turns kept as context per conversation
+ignore_groups = true      # only answer 1:1 conversations
