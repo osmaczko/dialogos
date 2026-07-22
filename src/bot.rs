@@ -239,16 +239,7 @@ pub fn handle_event(
                 warn!(%convo_id, "ignoring a non-UTF-8 message");
                 return None;
             };
-            respond(
-                state,
-                client,
-                cfg,
-                &convo_id.to_string(),
-                text,
-                &sender,
-                now,
-                today,
-            )
+            respond(state, client, cfg, &convo_id, text, &sender, now, today)
         }
         Event::ConversationMembersChanged { .. } => None,
         Event::InboundError { message } => {
