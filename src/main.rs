@@ -38,7 +38,14 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(address = %address, "dialogos online");
     println!("dialogos address (share this out of band): {address}");
 
-    bot::run(events, client, backend, &cfg);
+    // SIGINT/SIGTERM (systemd stop) trigger a graceful drain, not an abrupt kill.
+    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
+    ctrlc::set_handler(move || {
+        let _ = shutdown_tx.try_send(());
+    })
+    .context("installing the shutdown signal handler")?;
+
+    bot::run(events, client, backend, &cfg, shutdown_rx);
     Ok(())
 }
 

@@ -8,10 +8,12 @@
 //! - [`config`]: the TOML file plus the two secrets from the environment.
 //! - [`llm`]: the swappable LLM backend (OpenAI Chat Completions wire format).
 //! - [`limits`]: per-conversation flood control and the global daily budget.
-//! - [`bot`]: the event loop, per-conversation state, and the reply path.
+//! - [`convos`]: the bounded, two-tier per-conversation store.
+//! - [`bot`]: the worker-pool event loop and the reply path.
 #![forbid(unsafe_code)]
 
 pub mod bot;
 pub mod config;
+pub mod convos;
 pub mod limits;
 pub mod llm;

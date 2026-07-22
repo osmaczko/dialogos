@@ -8,7 +8,11 @@
 //! window. The daily budget is what actually bounds spend.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// Rate-limit thresholds, resolved from config.
 #[derive(Debug, Clone)]
@@ -17,6 +21,12 @@ pub struct Limits {
     pub per_convo_max_messages: usize,
     pub daily_max_messages: u32,
     pub daily_max_tokens: u64,
+    /// Cap on conversations kept with full state (history, limiter). Bounds
+    /// memory against a flood of throwaway devnet identities.
+    pub max_active_conversations: usize,
+    /// Cap on demoted conversations kept as a two-bit skeleton (greeted,
+    /// ignored), so a returning peer is neither re-greeted nor misclassified.
+    pub max_known_conversations: usize,
 }
 
 /// Per-conversation flood control: a sliding window of recent inbound times
@@ -30,19 +40,55 @@ pub struct ConvoLimiter {
 
 /// Global spend cap, reset at each UTC-midnight day boundary. `day` is days
 /// since the Unix epoch; a change rolls the counters back to zero.
+///
+/// When constructed with [`DailyBudget::load`] the counters are persisted to a
+/// sidecar file on every change, so a restart (or crash loop) resumes today's
+/// spend instead of resetting the cap. A budget built with `default()` (used in
+/// tests) has no path and never persists.
 #[derive(Debug, Default)]
 pub struct DailyBudget {
+    day: u64,
+    messages: u32,
+    tokens: u64,
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BudgetSnapshot {
     day: u64,
     messages: u32,
     tokens: u64,
 }
 
 impl DailyBudget {
+    /// Restore counters from `path` (best-effort: a missing, unreadable, or
+    /// unparsable file yields a zeroed budget), and persist future changes to it.
+    pub fn load(path: PathBuf) -> Self {
+        let mut budget = Self {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<BudgetSnapshot>(&raw) {
+                Ok(snapshot) => {
+                    budget.day = snapshot.day;
+                    budget.messages = snapshot.messages;
+                    budget.tokens = snapshot.tokens;
+                }
+                Err(err) => warn!(?path, error = %err, "ignoring an unparsable budget file"),
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => warn!(?path, error = %err, "could not read the budget file"),
+        }
+        budget
+    }
+
     fn rollover(&mut self, today: u64) {
         if self.day != today {
             self.day = today;
             self.messages = 0;
             self.tokens = 0;
+            self.persist();
         }
     }
 
@@ -51,10 +97,36 @@ impl DailyBudget {
         self.rollover(today);
         self.messages = self.messages.saturating_add(1);
         self.tokens = self.tokens.saturating_add(tokens);
+        self.persist();
     }
 
     fn exhausted(&self, limits: &Limits) -> bool {
         self.messages >= limits.daily_max_messages || self.tokens >= limits.daily_max_tokens
+    }
+
+    /// Force a final write, e.g. on shutdown. Records already write through, so
+    /// this is belt-and-suspenders against a future non-persisting mutation.
+    pub fn flush(&self) {
+        self.persist();
+    }
+
+    /// Write the counters to the sidecar file via a temp-then-rename, so a
+    /// crash mid-write cannot leave a torn file. A write failure is logged, not
+    /// fatal: the cap keeps working in memory.
+    fn persist(&self) {
+        let Some(path) = &self.path else { return };
+        let snapshot = BudgetSnapshot {
+            day: self.day,
+            messages: self.messages,
+            tokens: self.tokens,
+        };
+        let Ok(json) = serde_json::to_string(&snapshot) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path)) {
+            warn!(?path, error = %err, "could not persist the budget");
+        }
     }
 }
 
@@ -130,6 +202,8 @@ mod tests {
             per_convo_max_messages: 3,
             daily_max_messages: 5,
             daily_max_tokens: 1_000,
+            max_active_conversations: 1_024,
+            max_known_conversations: 65_536,
         }
     }
 
@@ -219,6 +293,46 @@ mod tests {
             admit(&mut fresh, &mut budget, Instant::now(), 0, &l),
             Admission::Deny(_)
         ));
+    }
+
+    fn temp_budget_path() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "dialogos-budget-test-{}-{n}.json",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn budget_persists_and_reloads_todays_counters() {
+        let path = temp_budget_path();
+        let _ = std::fs::remove_file(&path);
+
+        let mut budget = DailyBudget::load(path.clone());
+        budget.record(20_000, 100);
+        budget.record(20_000, 50);
+
+        // A restart on the same day resumes the accumulated spend.
+        let reloaded = DailyBudget::load(path.clone());
+        assert_eq!(reloaded.messages, 2);
+        assert_eq!(reloaded.tokens, 150);
+        assert_eq!(reloaded.day, 20_000);
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_budget_file_is_tolerated() {
+        let path = temp_budget_path();
+        std::fs::write(&path, "not json").unwrap();
+
+        let budget = DailyBudget::load(path.clone());
+        assert_eq!(budget.messages, 0);
+        assert_eq!(budget.tokens, 0);
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

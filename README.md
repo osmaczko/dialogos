@@ -33,7 +33,11 @@ design in this version:
   sent while the bot is down are never answered.
 - **No identity-layer abuse control.** Auto-join has no allowlist and testnet
   identities are free to mint, so all rate limiting is bot-side and best-effort.
-  The global daily budget is the real spend cap.
+  The global daily budget is the real spend cap, and it is persisted next to the
+  store so a crash loop cannot reset it. Per-conversation state is bounded and
+  evicted least-recently-active, so a flood of identities cannot grow the bot's
+  own memory without limit; the MLS group state libchat keeps per conversation
+  is not bot-evictable, so that memory remains unbounded upstream.
 
 ## Configuration
 

@@ -57,6 +57,15 @@ pub struct Identity {
     pub registry_url: Option<String>,
 }
 
+impl Identity {
+    /// Sidecar path for the persisted daily budget, next to the on-disk store.
+    /// Keyed to the (stable) store path so the spend cap survives a restart even
+    /// though the identity behind the store does not.
+    pub fn budget_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}.budget.json", self.db_path))
+    }
+}
+
 pub struct Llm {
     pub base_url: String,
     pub model: String,
@@ -64,6 +73,9 @@ pub struct Llm {
     pub max_output_tokens: u32,
     pub temperature: f32,
     pub request_timeout: Duration,
+    /// Worker threads making concurrent LLM calls, so a slow reply in one
+    /// conversation does not stall the others.
+    pub workers: usize,
 }
 
 pub struct Behavior {
@@ -111,12 +123,15 @@ impl Config {
                 max_output_tokens: file.llm.max_output_tokens,
                 temperature: file.llm.temperature,
                 request_timeout: Duration::from_secs(file.llm.request_timeout_secs),
+                workers: file.llm.workers,
             },
             limits: Limits {
                 per_convo_window: Duration::from_secs(file.limits.per_convo_window_secs),
                 per_convo_max_messages: file.limits.per_convo_max_messages,
                 daily_max_messages: file.limits.global_daily_max_messages,
                 daily_max_tokens: file.limits.global_daily_max_tokens,
+                max_active_conversations: file.limits.max_active_conversations,
+                max_known_conversations: file.limits.max_known_conversations,
             },
             behavior: Behavior {
                 greeting: file.behavior.greeting,
@@ -179,6 +194,8 @@ struct FileLlm {
     temperature: f32,
     #[serde(default = "default_request_timeout_secs")]
     request_timeout_secs: u64,
+    #[serde(default = "default_workers")]
+    workers: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +205,10 @@ struct FileLimits {
     per_convo_window_secs: u64,
     global_daily_max_messages: u32,
     global_daily_max_tokens: u64,
+    #[serde(default = "default_max_active_conversations")]
+    max_active_conversations: usize,
+    #[serde(default = "default_max_known_conversations")]
+    max_known_conversations: usize,
 }
 
 impl Default for FileLimits {
@@ -197,6 +218,8 @@ impl Default for FileLimits {
             per_convo_window_secs: 300,
             global_daily_max_messages: 2_000,
             global_daily_max_tokens: 500_000,
+            max_active_conversations: default_max_active_conversations(),
+            max_known_conversations: default_max_known_conversations(),
         }
     }
 }
@@ -231,6 +254,15 @@ fn default_temperature() -> f32 {
 fn default_request_timeout_secs() -> u64 {
     60
 }
+fn default_workers() -> usize {
+    4
+}
+fn default_max_active_conversations() -> usize {
+    1_024
+}
+fn default_max_known_conversations() -> usize {
+    65_536
+}
 fn default_greeting() -> String {
     "Hi, I'm an AI assistant. Ask me anything.".to_string()
 }
@@ -258,7 +290,10 @@ mod tests {
         "#;
         let file: FileConfig = toml::from_str(toml).unwrap();
         assert_eq!(file.llm.max_output_tokens, 512);
+        assert_eq!(file.llm.workers, 4);
         assert_eq!(file.limits.per_convo_max_messages, 10);
+        assert_eq!(file.limits.max_active_conversations, 1_024);
+        assert_eq!(file.limits.max_known_conversations, 65_536);
         assert!(file.behavior.ignore_groups);
         assert_eq!(file.identity.registry_url, None);
     }

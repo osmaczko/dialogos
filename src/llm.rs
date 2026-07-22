@@ -5,8 +5,13 @@
 //! api_key)` config value rather than a code path: swapping a free model for a
 //! paid one, or one vendor for another, is an edit to the config file.
 
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{Context, anyhow};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::config::Llm;
 
@@ -58,10 +63,83 @@ pub struct Completion {
     pub tokens_used: Option<u32>,
 }
 
+/// A failed completion, classified by whether retrying could help.
+#[derive(Debug, thiserror::Error)]
+pub enum LlmError {
+    /// A connection error, timeout, HTTP 429, or 5xx: transient, worth retrying.
+    #[error("{0}")]
+    Transient(anyhow::Error),
+    /// A non-retryable 4xx (bad key or request) or an unparsable response.
+    #[error("{0}")]
+    Permanent(anyhow::Error),
+}
+
+impl LlmError {
+    pub fn is_transient(&self) -> bool {
+        matches!(self, LlmError::Transient(_))
+    }
+}
+
 /// The one thing the bot needs from a model: system prompt + prior turns in,
-/// assistant reply out. `Send + Sync` so a future thread pool can share it.
+/// assistant reply out. `Send + Sync` so the worker pool can share it.
 pub trait LlmBackend: Send + Sync {
-    fn complete(&self, system: &str, history: &[Turn]) -> anyhow::Result<Completion>;
+    fn complete(&self, system: &str, history: &[Turn]) -> Result<Completion, LlmError>;
+}
+
+/// How [`complete_with_retry`] backs off between transient failures.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Exponential backoff `base * 2^attempt`, capped at `max_delay` (attempt is
+/// 0-based). No jitter: at this worker count there is no herd to decorrelate.
+fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
+    let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
+    let ms = (policy.base_delay.as_millis() as u64)
+        .saturating_mul(factor)
+        .min(policy.max_delay.as_millis() as u64);
+    Duration::from_millis(ms)
+}
+
+/// Call `backend.complete`, retrying transient failures up to
+/// `policy.max_attempts` with exponential backoff. Permanent failures return
+/// immediately.
+pub fn complete_with_retry(
+    backend: &dyn LlmBackend,
+    system: &str,
+    history: &[Turn],
+    policy: &RetryPolicy,
+) -> Result<Completion, LlmError> {
+    let mut attempt = 0;
+    loop {
+        match backend.complete(system, history) {
+            Ok(completion) => return Ok(completion),
+            Err(err) => {
+                attempt += 1;
+                if attempt >= policy.max_attempts || !err.is_transient() {
+                    return Err(err);
+                }
+                let delay = backoff_delay(policy, attempt - 1);
+                warn!(attempt, ?delay, error = %err, "LLM call failed transiently; retrying");
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+            }
+        }
+    }
 }
 
 /// An [`LlmBackend`] against any OpenAI-compatible `/chat/completions` endpoint.
@@ -93,7 +171,7 @@ impl OpenAiCompatBackend {
 }
 
 impl LlmBackend for OpenAiCompatBackend {
-    fn complete(&self, system: &str, history: &[Turn]) -> anyhow::Result<Completion> {
+    fn complete(&self, system: &str, history: &[Turn]) -> Result<Completion, LlmError> {
         let request = ChatRequest {
             model: &self.model,
             messages: build_messages(system, history),
@@ -101,26 +179,36 @@ impl LlmBackend for OpenAiCompatBackend {
             temperature: self.temperature,
         };
 
+        // Connection and timeout errors are transient; retrying can succeed.
         let response = self
             .http
             .post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(&request)
             .send()
-            .context("sending the chat completion request")?;
+            .context("sending the chat completion request")
+            .map_err(LlmError::Transient)?;
 
         let status = response.status();
         // The body may echo the prompt or user content, so it is read for
         // parsing but never surfaced in an error (only the status is).
         let body = response
             .text()
-            .context("reading the chat completion response body")?;
+            .context("reading the chat completion response body")
+            .map_err(LlmError::Transient)?;
         if !status.is_success() {
-            return Err(anyhow!(
-                "chat completion request failed with status {status}"
-            ));
+            let err = anyhow!("chat completion request failed with status {status}");
+            // 429 and 5xx are worth retrying; other 4xx are configuration or
+            // request errors that will not fix themselves.
+            return Err(
+                if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                    LlmError::Transient(err)
+                } else {
+                    LlmError::Permanent(err)
+                },
+            );
         }
-        parse_response(&body)
+        parse_response(&body).map_err(LlmError::Permanent)
     }
 }
 
@@ -248,5 +336,91 @@ mod tests {
     fn null_or_blank_content_is_an_error() {
         assert!(parse_response(r#"{"choices": [{"message": {"content": null}}]}"#).is_err());
         assert!(parse_response(r#"{"choices": [{"message": {"content": "   "}}]}"#).is_err());
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Fails transiently `fail_times`, then succeeds; counts calls.
+    struct Flaky {
+        fail_times: u32,
+        permanent: bool,
+        calls: AtomicU32,
+    }
+
+    impl LlmBackend for Flaky {
+        fn complete(&self, _system: &str, _history: &[Turn]) -> Result<Completion, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::Relaxed);
+            if n < self.fail_times {
+                let err = anyhow!("boom");
+                Err(if self.permanent {
+                    LlmError::Permanent(err)
+                } else {
+                    LlmError::Transient(err)
+                })
+            } else {
+                Ok(Completion {
+                    text: "ok".to_string(),
+                    tokens_used: None,
+                })
+            }
+        }
+    }
+
+    fn instant_policy(max_attempts: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_attempts,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn retries_transient_failures_until_success() {
+        let backend = Flaky {
+            fail_times: 2,
+            permanent: false,
+            calls: AtomicU32::new(0),
+        };
+        let completion =
+            complete_with_retry(&backend, "s", &[], &instant_policy(3)).expect("should succeed");
+        assert_eq!(completion.text, "ok");
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn does_not_retry_a_permanent_failure() {
+        let backend = Flaky {
+            fail_times: 5,
+            permanent: true,
+            calls: AtomicU32::new(0),
+        };
+        let err = complete_with_retry(&backend, "s", &[], &instant_policy(3)).unwrap_err();
+        assert!(matches!(err, LlmError::Permanent(_)));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn gives_up_after_max_attempts() {
+        let backend = Flaky {
+            fail_times: 10,
+            permanent: false,
+            calls: AtomicU32::new(0),
+        };
+        let err = complete_with_retry(&backend, "s", &[], &instant_policy(3)).unwrap_err();
+        assert!(err.is_transient());
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_caps() {
+        let policy = RetryPolicy {
+            max_attempts: 10,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+        };
+        assert_eq!(backoff_delay(&policy, 0), Duration::from_secs(1));
+        assert_eq!(backoff_delay(&policy, 1), Duration::from_secs(2));
+        assert_eq!(backoff_delay(&policy, 2), Duration::from_secs(4));
+        assert_eq!(backoff_delay(&policy, 20), Duration::from_secs(30));
     }
 }

@@ -6,7 +6,8 @@
 # Encrypted on-disk store path. Holds only bookkeeping (metadata, keys), not the
 # in-memory MLS group state, and the identity is regenerated every run, so the
 # address changes on restart and prior conversations cannot be resumed (see the
-# README's "Accepted limitations").
+# README's "Accepted limitations"). The daily budget is persisted alongside it
+# in "<db_path>.budget.json" so a restart resumes the day's spend cap.
 db_path = "./dialogos.db"
 # registry_url = "https://devnet.chat-kc.logos.co"   # optional; this is the default
 
@@ -21,6 +22,9 @@ system_prompt_path = "./system-prompt.txt"
 max_output_tokens = 512
 temperature = 0.7
 request_timeout_secs = 60
+# Worker threads making concurrent LLM calls, so a slow reply in one
+# conversation does not stall the others.
+workers = 4
 
 # Equally valid free alternatives (same code path, config-only swap):
 #   Google AI Studio (Gemini free tier):
@@ -40,6 +44,11 @@ per_convo_window_secs = 300
 # replies until the next UTC-midnight reset.
 global_daily_max_messages = 2000
 global_daily_max_tokens = 500000
+# Memory bounds on conversation state (devnet identities are free to mint, so
+# this caps what a flood of them can consume). Conversations beyond the active
+# cap keep only a two-bit skeleton; beyond the known cap they are forgotten.
+max_active_conversations = 1024
+max_known_conversations = 65536
 
 [behavior]
 greeting = "Hi, I'm an AI assistant. Ask me anything."

@@ -1,22 +1,25 @@
 //! End-to-end over the in-process transport: a peer opens a direct conversation
 //! with the bot and exchanges a message, and the real event-handling code path
 //! (`bot::handle_event`) greets and replies. The LLM backend is a deterministic
-//! fake, so the assertions are stable and no network is touched.
+//! fake and a returned `Job` is settled inline (standing in for the worker
+//! pool), so the assertions are stable and no network is touched.
 //!
 //! This mirrors libchat's own `crates/generic-chat/tests/saro_and_raya.rs`. It
 //! needs the native `liblogosdelivery` to compile the crate (a transitive
 //! `logos-chat` build dependency) even though the test itself uses only the
 //! pure-Rust `InProcessDelivery`, so it runs under the nix/CI build path, not a
 //! plain `cargo test` on a box without the native library. See the README.
+//!
+//! The worker-pool loop (`bot::run`) itself is exercised in `worker_pool.rs`.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
-use dialogos::bot::{BotState, SendMessage, handle_event};
+use dialogos::bot::{BotState, Outcome, SendMessage, handle_event, handle_outcome};
 use dialogos::config::{Behavior, Config, Identity, Llm};
 use dialogos::limits::Limits;
-use dialogos::llm::{Completion, LlmBackend, Turn};
+use dialogos::llm::{Completion, LlmBackend, LlmError, Turn};
 
 use logos_account::TestLogosAccount;
 use logos_chat::{
@@ -28,7 +31,7 @@ struct FakeBackend {
 }
 
 impl LlmBackend for FakeBackend {
-    fn complete(&self, _system: &str, _history: &[Turn]) -> anyhow::Result<Completion> {
+    fn complete(&self, _system: &str, _history: &[Turn]) -> Result<Completion, LlmError> {
         Ok(Completion {
             text: self.reply.clone(),
             tokens_used: Some(7),
@@ -50,12 +53,15 @@ fn test_config() -> Config {
             max_output_tokens: 128,
             temperature: 0.0,
             request_timeout: Duration::from_secs(1),
+            workers: 1,
         },
         limits: Limits {
             per_convo_window: Duration::from_secs(300),
             per_convo_max_messages: 10,
             daily_max_messages: 1_000,
             daily_max_tokens: 1_000_000,
+            max_active_conversations: 1_024,
+            max_known_conversations: 65_536,
         },
         behavior: Behavior {
             greeting: "hello from the bot".to_string(),
@@ -134,7 +140,8 @@ fn bot_greets_and_replies_over_in_process_transport() {
     );
 }
 
-/// Process every currently-pending bot event, waiting up to 5s for the first.
+/// Process every currently-pending bot event, settling any dispatched reply
+/// inline with the fake backend.
 fn drain_bot_events(
     events: &Receiver<Event>,
     state: &mut BotState,
@@ -144,7 +151,17 @@ fn drain_bot_events(
 ) {
     let mut timeout = Duration::from_secs(5);
     while let Ok(event) = events.recv_timeout(timeout) {
-        handle_event(event, state, client, backend, cfg);
+        let now = Instant::now();
+        let today = 0;
+        let mut job = handle_event(event, state, client, cfg, now, today);
+        while let Some(j) = job.take() {
+            let result = backend.complete(&cfg.behavior.system_prompt, &j.context);
+            let outcome = Outcome {
+                convo_id: j.convo_id,
+                result,
+            };
+            job = handle_outcome(outcome, state, client, cfg, today, true);
+        }
         timeout = Duration::from_millis(300);
     }
 }
