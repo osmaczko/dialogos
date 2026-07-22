@@ -17,7 +17,7 @@ name = "dialogos"
 path = "src/main.rs"
 
 [dependencies]
-logos-chat = { git = "ssh://git@github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231" }
+logos-chat = { git = "https://github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231" }
 crossbeam-channel = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 # TestLogosAccount, to stand up a peer that talks to the bot over the
 # in-process transport in the integration test. Same rev as logos-chat.
-logos-account = { git = "ssh://git@github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231", features = ["dev"] }
+logos-account = { git = "https://github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231", features = ["dev"] }
 # IdentId, to construct MessageSender in the deterministic handle_event test.
-libchat = { git = "ssh://git@github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231" }
+libchat = { git = "https://github.com/logos-messaging/libchat.git", rev = "6ab0d8a79f59cc3b5ed6626b072e7189fa677231" }
