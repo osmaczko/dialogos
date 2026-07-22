@@ -38,6 +38,9 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(address = %address, "dialogos online");
     println!("dialogos address (share this out of band): {address}");
 
+    // Tell systemd we are up; a no-op when not run under systemd.
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+
     // SIGINT/SIGTERM (systemd stop) trigger a graceful drain, not an abrupt kill.
     let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded::<()>(1);
     ctrlc::set_handler(move || {
@@ -45,7 +48,12 @@ fn main() -> anyhow::Result<()> {
     })
     .context("installing the shutdown signal handler")?;
 
-    bot::run(events, client, backend, &cfg, shutdown_rx);
+    // Pet the systemd watchdog on each loop tick: a wedged event loop stops
+    // petting and systemd restarts it. This detects a stalled loop, not a native
+    // node that silently stops delivering events (libchat exposes no such signal).
+    bot::run(events, client, backend, &cfg, shutdown_rx, || {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]);
+    });
     Ok(())
 }
 

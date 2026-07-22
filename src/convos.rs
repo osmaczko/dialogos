@@ -82,6 +82,7 @@ pub struct ConvoStore {
     next_seq: u64,
     max_active: usize,
     max_known: usize,
+    demotions: u64,
 }
 
 impl ConvoStore {
@@ -92,7 +93,13 @@ impl ConvoStore {
             next_seq: 0,
             max_active,
             max_known,
+            demotions: 0,
         }
+    }
+
+    /// Total conversations demoted from the active tier since start (for stats).
+    pub fn demotion_count(&self) -> u64 {
+        self.demotions
     }
 
     pub fn get(&self, id: &str) -> Option<&ConvoState> {
@@ -171,6 +178,7 @@ impl ConvoStore {
     }
 
     fn demote(&mut self, id: String, skeleton: Skeleton) {
+        self.demotions += 1;
         let seq = self.next_seq;
         self.next_seq += 1;
         self.known.insert(id, (skeleton, seq));

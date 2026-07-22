@@ -9,10 +9,11 @@
 //! at a time and further admitted messages wait in a small bounded queue.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{Receiver, Sender, select};
+use crossbeam_channel::{Receiver, Sender, select, tick};
 use logos_chat::{
     AccountDirectory, ChatClient, ChatStore, ConversationClass, Event, MessageSender,
     RegistrationService, Transport,
@@ -32,6 +33,12 @@ pub const PENDING_CAP: usize = 4;
 /// How long, at most, to keep draining in-flight replies after a shutdown
 /// signal before exiting.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
+
+/// The loop's periodic tick: fires the liveness heartbeat and paces stats.
+const TICK: Duration = Duration::from_secs(30);
+
+/// Emit a stats line every this many ticks (30s * 20 = 10 minutes).
+const STATS_EVERY: u64 = 20;
 
 /// The one client capability the bot needs: send bytes to a conversation. A
 /// trait so the event loop can be driven by an in-process test transport
@@ -65,6 +72,17 @@ pub struct Outcome {
     pub result: Result<Completion, LlmError>,
 }
 
+/// Running counters since start, emitted periodically as a stats line. Retries
+/// are counted separately (in an atomic shared with the worker threads).
+#[derive(Debug, Default)]
+pub struct Metrics {
+    pub events_received: u64,
+    pub replies_sent: u64,
+    pub denies: u64,
+    pub silent_drops: u64,
+    pub llm_failures: u64,
+}
+
 /// All mutable bot state: the bounded per-conversation store and the global
 /// daily budget shared across conversations.
 pub struct BotState {
@@ -73,6 +91,7 @@ pub struct BotState {
     /// The day a "provider omitted token usage" warning was last logged, so it
     /// is emitted at most once per UTC day rather than per message.
     missing_usage_warned_day: Option<u64>,
+    metrics: Metrics,
 }
 
 impl BotState {
@@ -82,6 +101,7 @@ impl BotState {
             convos: ConvoStore::new(1_024, 65_536),
             budget: DailyBudget::default(),
             missing_usage_warned_day: None,
+            metrics: Metrics::default(),
         }
     }
 
@@ -93,7 +113,12 @@ impl BotState {
             ),
             budget: DailyBudget::load(cfg.identity.budget_path()),
             missing_usage_warned_day: None,
+            metrics: Metrics::default(),
         }
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 }
 
@@ -112,11 +137,13 @@ pub fn run(
     backend: Arc<dyn LlmBackend>,
     cfg: &Config,
     shutdown: Receiver<()>,
+    mut on_heartbeat: impl FnMut(),
 ) {
     let worker_count = cfg.llm.workers.max(1);
     let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
     let (out_tx, out_rx) = crossbeam_channel::unbounded::<Outcome>();
     let policy = RetryPolicy::default();
+    let retries = Arc::new(AtomicU64::new(0));
 
     for _ in 0..worker_count {
         let job_rx = job_rx.clone();
@@ -124,7 +151,8 @@ pub fn run(
         let backend = Arc::clone(&backend);
         let system = cfg.behavior.system_prompt.clone();
         let policy = policy.clone();
-        thread::spawn(move || worker_loop(job_rx, out_tx, backend, system, policy));
+        let retries = Arc::clone(&retries);
+        thread::spawn(move || worker_loop(job_rx, out_tx, backend, system, policy, retries));
     }
     // Drop the loop's own handles so the worker clones are the only holders: the
     // job channel closing is what tells workers to exit at shutdown.
@@ -132,6 +160,8 @@ pub fn run(
     drop(out_tx);
 
     let mut state = BotState::from_config(cfg);
+    let ticker = tick(TICK);
+    let mut tick_count: u64 = 0;
 
     loop {
         select! {
@@ -151,6 +181,14 @@ pub fn run(
                     if let Some(job) = handle_outcome(outcome, &mut state, &mut client, cfg, today, true) {
                         let _ = job_tx.send(job);
                     }
+                }
+            },
+            recv(ticker) -> _ => {
+                // Liveness heartbeat (systemd watchdog), and a periodic stats line.
+                on_heartbeat();
+                tick_count += 1;
+                if tick_count % STATS_EVERY == 0 {
+                    emit_stats(&state, &retries, current_day());
                 }
             },
             recv(shutdown) -> _ => break,
@@ -185,9 +223,11 @@ fn worker_loop(
     backend: Arc<dyn LlmBackend>,
     system: String,
     policy: RetryPolicy,
+    retries: Arc<AtomicU64>,
 ) {
     while let Ok(job) = jobs.recv() {
-        let result = complete_with_retry(backend.as_ref(), &system, &job.context, &policy);
+        let result =
+            complete_with_retry(backend.as_ref(), &system, &job.context, &policy, &retries);
         if outcomes
             .send(Outcome {
                 convo_id: job.convo_id,
@@ -200,6 +240,25 @@ fn worker_loop(
     }
 }
 
+/// Log one stats line: counters since start plus current gauges.
+fn emit_stats(state: &BotState, retries: &AtomicU64, today: u64) {
+    let m = &state.metrics;
+    let (budget_messages, budget_tokens) = state.budget.spent(today);
+    info!(
+        events = m.events_received,
+        replies = m.replies_sent,
+        denies = m.denies,
+        drops = m.silent_drops,
+        llm_failures = m.llm_failures,
+        retries = retries.load(Ordering::Relaxed),
+        evictions = state.convos.demotion_count(),
+        active_convos = state.convos.active_len(),
+        budget_messages,
+        budget_tokens,
+        "stats"
+    );
+}
+
 /// Handle one inbound event, returning a `Job` to dispatch if it produced work.
 /// Public so tests can drive it directly with constructed events.
 pub fn handle_event(
@@ -210,6 +269,7 @@ pub fn handle_event(
     now: Instant,
     today: u64,
 ) -> Option<Job> {
+    state.metrics.events_received += 1;
     match event {
         Event::ConversationStarted { convo_id, class } => {
             // Record the class now: MessageReceived carries no class, so this is
@@ -295,8 +355,12 @@ fn respond(
         )
     };
     match admission {
-        Admission::SilentlyDrop => return None,
+        Admission::SilentlyDrop => {
+            state.metrics.silent_drops += 1;
+            return None;
+        }
         Admission::Deny(reply) => {
+            state.metrics.denies += 1;
             send(client, convo, reply.as_bytes());
             return None;
         }
@@ -316,6 +380,7 @@ fn respond(
             convo_state.pending.push_back(text.to_string());
         } else {
             debug!(%convo, "pending queue full; dropping the message");
+            state.metrics.silent_drops += 1;
         }
         None
     } else {
@@ -358,9 +423,13 @@ pub fn handle_outcome(
         }
     }
 
-    if let Ok(completion) = &outcome.result {
-        record_reply(state, today, completion.tokens_used);
-        send(client, &convo, completion.text.as_bytes());
+    match &outcome.result {
+        Ok(completion) => {
+            record_reply(state, today, completion.tokens_used);
+            state.metrics.replies_sent += 1;
+            send(client, &convo, completion.text.as_bytes());
+        }
+        Err(_) => state.metrics.llm_failures += 1,
     }
 
     if !dispatch_next {

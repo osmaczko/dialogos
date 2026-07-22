@@ -4,14 +4,20 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# The process signals readiness and pets the watchdog via sd_notify.
+Type=notify
+NotifyAccess=main
 # Dedicated unprivileged identity, allocated per start; no host user footprint.
 DynamicUser=true
 StateDirectory=dialogos
 WorkingDirectory=/var/lib/dialogos
 ExecStart=/usr/local/bin/dialogos --config /etc/dialogos/config.toml
 Environment=RUST_LOG=info
-# DIALOGOS_DB_KEY and LLM_API_KEY. Keep this file root-owned, mode 0600.
-EnvironmentFile=/etc/dialogos/secrets.env
+# Secrets as credentials: root-owned files exposed per-start via
+# $CREDENTIALS_DIRECTORY (not the environment, not a dumpable env file). The bot
+# reads $DIALOGOS_DB_KEY / $LLM_API_KEY first and falls back to these.
+LoadCredential=db_key:/etc/dialogos/db_key
+LoadCredential=llm_api_key:/etc/dialogos/llm_api_key
 
 # --- Isolation (level b): deny host access, contain the blast radius of a
 # --- fault in the in-process native p2p node that parses untrusted traffic.
@@ -46,6 +52,10 @@ MemoryMax=1G
 # RestrictAddressFamilies (add AF_NETLINK if the node needs interface
 # enumeration), then SystemCallFilter. Loosen only what is needed.
 
+# The event loop pets the watchdog every 30s; a wedged loop is killed and
+# restarted after 90s. This catches a stalled loop, not a native node that
+# silently stops delivering events (libchat exposes no health signal).
+WatchdogSec=90
 # One run = one address (accepted). A restart comes back on a NEW address, and
 # all prior conversations are permanently lost.
 Restart=on-failure

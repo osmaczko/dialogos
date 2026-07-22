@@ -298,3 +298,40 @@ fn a_pending_reply_in_one_conversation_does_not_block_another() {
 
     assert_ne!(job_a.convo_id, job_b.convo_id);
 }
+
+#[test]
+fn metrics_count_events_and_replies() {
+    let cfg = config(true);
+    let mut state = BotState::new();
+    let mut client = Recorder::default();
+    let backend = FixedBackend;
+    let now = Instant::now();
+
+    // A private conversation: started + one message -> greet + one reply.
+    let job = handle_event(
+        started("p", ConversationClass::Private),
+        &mut state,
+        &mut client,
+        &cfg,
+        now,
+        0,
+    );
+    settle(job, &mut state, &mut client, &backend, &cfg);
+    let job = handle_event(message("p", "hi"), &mut state, &mut client, &cfg, now, 0);
+    settle(job, &mut state, &mut client, &backend, &cfg);
+
+    // An ignored group: two more events received, no reply.
+    handle_event(
+        started("g", ConversationClass::Group),
+        &mut state,
+        &mut client,
+        &cfg,
+        now,
+        0,
+    );
+    handle_event(message("g", "hi"), &mut state, &mut client, &cfg, now, 0);
+
+    let m = state.metrics();
+    assert_eq!(m.events_received, 4);
+    assert_eq!(m.replies_sent, 1);
+}

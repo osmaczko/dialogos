@@ -5,6 +5,7 @@
 //! api_key)` config value rather than a code path: swapping a free model for a
 //! paid one, or one vendor for another, is an edit to the config file.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -116,12 +117,13 @@ fn backoff_delay(policy: &RetryPolicy, attempt: u32) -> Duration {
 
 /// Call `backend.complete`, retrying transient failures up to
 /// `policy.max_attempts` with exponential backoff. Permanent failures return
-/// immediately.
+/// immediately. Each retry bumps `retries` (shared across workers, for stats).
 pub fn complete_with_retry(
     backend: &dyn LlmBackend,
     system: &str,
     history: &[Turn],
     policy: &RetryPolicy,
+    retries: &AtomicU64,
 ) -> Result<Completion, LlmError> {
     let mut attempt = 0;
     loop {
@@ -132,6 +134,7 @@ pub fn complete_with_retry(
                 if attempt >= policy.max_attempts || !err.is_transient() {
                     return Err(err);
                 }
+                retries.fetch_add(1, Ordering::Relaxed);
                 let delay = backoff_delay(policy, attempt - 1);
                 warn!(attempt, ?delay, error = %err, "LLM call failed transiently; retrying");
                 if !delay.is_zero() {
@@ -381,10 +384,12 @@ mod tests {
             permanent: false,
             calls: AtomicU32::new(0),
         };
-        let completion =
-            complete_with_retry(&backend, "s", &[], &instant_policy(3)).expect("should succeed");
+        let retries = AtomicU64::new(0);
+        let completion = complete_with_retry(&backend, "s", &[], &instant_policy(3), &retries)
+            .expect("should succeed");
         assert_eq!(completion.text, "ok");
         assert_eq!(backend.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(retries.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -394,9 +399,12 @@ mod tests {
             permanent: true,
             calls: AtomicU32::new(0),
         };
-        let err = complete_with_retry(&backend, "s", &[], &instant_policy(3)).unwrap_err();
+        let retries = AtomicU64::new(0);
+        let err =
+            complete_with_retry(&backend, "s", &[], &instant_policy(3), &retries).unwrap_err();
         assert!(matches!(err, LlmError::Permanent(_)));
         assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(retries.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -406,9 +414,12 @@ mod tests {
             permanent: false,
             calls: AtomicU32::new(0),
         };
-        let err = complete_with_retry(&backend, "s", &[], &instant_policy(3)).unwrap_err();
+        let retries = AtomicU64::new(0);
+        let err =
+            complete_with_retry(&backend, "s", &[], &instant_policy(3), &retries).unwrap_err();
         assert!(err.is_transient());
         assert_eq!(backend.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(retries.load(Ordering::Relaxed), 2);
     }
 
     #[test]

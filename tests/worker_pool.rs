@@ -144,7 +144,7 @@ fn run_replies_then_shuts_down_cleanly() {
 
     let bot = thread::spawn(move || {
         let cfg = config(2);
-        run(ev_rx, sink, backend, &cfg, sd_rx);
+        run(ev_rx, sink, backend, &cfg, sd_rx, || {});
     });
 
     ev_tx.send(started("p")).unwrap();
@@ -175,7 +175,7 @@ fn a_blocked_conversation_does_not_stall_another() {
     // Two workers: one can be stuck on "slow" while the other answers "fast".
     let bot = thread::spawn(move || {
         let cfg = config(2);
-        run(ev_rx, sink, backend, &cfg, sd_rx);
+        run(ev_rx, sink, backend, &cfg, sd_rx, || {});
     });
 
     // The slow conversation occupies a worker (it blocks on the gate).

@@ -104,6 +104,15 @@ impl DailyBudget {
         self.messages >= limits.daily_max_messages || self.tokens >= limits.daily_max_tokens
     }
 
+    /// Today's spend (messages, tokens) for stats; zero once the day has rolled.
+    pub fn spent(&self, today: u64) -> (u32, u64) {
+        if self.day == today {
+            (self.messages, self.tokens)
+        } else {
+            (0, 0)
+        }
+    }
+
     /// Force a final write, e.g. on shutdown. Records already write through, so
     /// this is belt-and-suspenders against a future non-persisting mutation.
     pub fn flush(&self) {

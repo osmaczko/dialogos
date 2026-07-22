@@ -50,6 +50,10 @@ secrets come from the environment, never the file:
 | `DIALOGOS_DB_KEY` | key for the encrypted on-disk store |
 | `LLM_API_KEY`     | API key for the LLM provider        |
 
+Under systemd these can instead be passed as credentials (`db_key`, `llm_api_key`
+files under `$CREDENTIALS_DIRECTORY`); the bot reads the environment first and
+falls back to the credential files. See `deploy/dialogos.service`.
+
 The system prompt is a separate file (`system-prompt.txt`); its path is
 resolved relative to the config file. It contains nothing about the host or
 operator, and the LLM is given no tools.
@@ -97,13 +101,32 @@ capabilities dropped, and writes confined to its state directory. It contains
 the blast radius of a fault in the in-process native node that parses untrusted
 traffic, and denies host access. A hardened container (non-root, read-only
 rootfs with a writable volume for the db, `--cap-drop=ALL`,
-`--security-opt=no-new-privileges`) is an equivalent alternative; build the
-image via libchat's nix flake so it carries the native library and a matching
-glibc.
+`--security-opt=no-new-privileges`) is an equivalent alternative. `nix build
+.#image` produces that image (the native library and a matching glibc come with
+it), and CI publishes it to `ghcr.io/osmaczko/dialogos` on version tags; that
+image is the supported deployment artifact.
 
 This is process-level isolation, not network-level anonymity: the p2p node
 exposes the host IP to testnet peers, and user messages egress to the LLM
 provider. Both are consequences of the chosen posture, not mitigated here.
+
+## Operating
+
+- **Logs**: `journalctl -u dialogos`. `RUST_LOG` controls verbosity (`info` by
+  default; `RUST_LOG=dialogos=debug` for the per-conversation detail). Every ten
+  minutes the bot logs a `stats` line (events, replies, denies, drops, LLM
+  failures, retries, evictions, active conversations, budget spent today).
+- **Budget tripped**: a `Daily limit reached` reply to peers and the daily
+  counters at the cap in the stats line mean the global budget is spent; replies
+  resume at the next UTC midnight. Raise `[limits]` if this trips too early, and
+  set a hard spend cap at the provider as a backstop. The budget persists in
+  `<db_path>.budget.json`, so a restart does not reset it.
+- **Rotating a secret** (`LLM_API_KEY` / `DIALOGOS_DB_KEY`): update the
+  environment or the credential file and restart. **A restart mints a new address
+  and loses all prior conversations** (see Accepted limitations), so treat it as a
+  disruptive action.
+- **Watchdog kill**: if the event loop wedges, systemd logs a watchdog timeout in
+  `systemctl status dialogos` and restarts the service (again, on a new address).
 
 ## Layout
 
@@ -111,13 +134,15 @@ provider. Both are consequences of the chosen posture, not mitigated here.
 src/
   lib.rs      crate root: module declarations and crate-level docs
   main.rs     startup: load config, open the client, print the address, run
-  config.rs   TOML + environment secrets, with fail-fast validation
-  llm.rs      LlmBackend trait + the OpenAI-compatible backend
-  limits.rs   per-conversation sliding window + global daily budget
-  bot.rs      event loop, per-conversation state, the reply path
+  config.rs   TOML + environment/credential secrets, with fail-fast validation
+  llm.rs      LlmBackend trait, retry, and the OpenAI-compatible backend
+  limits.rs   per-conversation sliding window + persisted global daily budget
+  convos.rs   bounded two-tier per-conversation store
+  bot.rs      worker-pool event loop, per-conversation state, the reply path
 tests/
-  event_handling.rs        greeting / reply / ignore_groups policy, deterministic
+  event_handling.rs        greeting / reply / ordering / pending policy, deterministic
   direct_conversation.rs   end-to-end over the in-process transport
+  worker_pool.rs           the run() loop: concurrency and clean shutdown
 ```
 
 ## Testing

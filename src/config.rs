@@ -17,6 +17,12 @@ pub const DB_KEY_ENV: &str = "DIALOGOS_DB_KEY";
 /// Environment variable holding the LLM provider API key.
 pub const LLM_API_KEY_ENV: &str = "LLM_API_KEY";
 
+/// systemd credential names, read from `$CREDENTIALS_DIRECTORY` when the matching
+/// environment variable is unset. Must match `deploy/dialogos.service`'s
+/// `LoadCredential=` entries.
+const DB_KEY_CREDENTIAL: &str = "db_key";
+const LLM_API_KEY_CREDENTIAL: &str = "llm_api_key";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading config file {path}: {source}")]
@@ -98,8 +104,8 @@ impl Config {
             source,
         })?;
 
-        let db_key = require_secret(DB_KEY_ENV)?;
-        let api_key = require_secret(LLM_API_KEY_ENV)?;
+        let db_key = require_secret(DB_KEY_ENV, DB_KEY_CREDENTIAL)?;
+        let api_key = require_secret(LLM_API_KEY_ENV, LLM_API_KEY_CREDENTIAL)?;
 
         let prompt_path = resolve_relative(path, &file.llm.system_prompt_path);
         let system_prompt = std::fs::read_to_string(&prompt_path)
@@ -143,11 +149,23 @@ impl Config {
     }
 }
 
-fn require_secret(var: &'static str) -> Result<String, ConfigError> {
-    match std::env::var(var) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        _ => Err(ConfigError::MissingSecret(var)),
+/// Resolve a secret from the environment first (dev and container use), then
+/// from a systemd credential file (`$CREDENTIALS_DIRECTORY/<credential>`).
+fn require_secret(var: &'static str, credential: &'static str) -> Result<String, ConfigError> {
+    if let Ok(value) = std::env::var(var)
+        && !value.is_empty()
+    {
+        return Ok(value);
     }
+    if let Ok(dir) = std::env::var("CREDENTIALS_DIRECTORY")
+        && let Ok(raw) = std::fs::read_to_string(Path::new(&dir).join(credential))
+    {
+        let value = raw.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+    Err(ConfigError::MissingSecret(var))
 }
 
 /// Resolve `target` relative to the config file's directory, unless it is
